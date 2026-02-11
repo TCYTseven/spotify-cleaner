@@ -25,6 +25,16 @@ The Intelligent Music Agent is a comprehensive music management system that brid
 - 🔌 **Daemon Architecture** - Background service with Unix socket communication
 - 🗣️ **Natural Language Processing** - Understands conversational music commands
 
+## 🌐 Web-First Mode (Recommended)
+
+The current recommended runtime is fully web-based and cross-platform:
+
+- **Frontend**: Next.js (`npm run dev`)
+- **Backend**: FastAPI (`uvicorn backend.main:app --reload`)
+- **Playback Control**: Spotify Web API (OAuth), no native OS automation required
+
+> AppleScript/native control is disabled by default (`MUSIC_AGENT_WEB_ONLY=1`) to keep the platform behavior consistent across Linux/macOS/Windows environments.
+
 ## Architecture
 
 ### Core Components
@@ -43,34 +53,46 @@ The agent uses SQLite to store:
 - **Lyric Patterns** - Known lyric fragments for song identification
 - **Preferences** - User settings and configuration
 
-## 🚀 Quick Start
+## 🚀 Quick Start (Web App)
 
-1. **Clone and Setup**:
+1. **Install backend dependencies**:
    ```bash
-   git clone https://github.com/tomcanham/intelligent-music-agent
-   cd intelligent-music-agent
-   ./setup_env.sh
+   pip install -r requirements.txt
    ```
 
-2. **Configure Spotify API**:
+2. **Configure Spotify credentials**:
    - Get credentials from [Spotify Developer Dashboard](https://developer.spotify.com/dashboard)
-   - Create `.spotify_credentials` file:
+   - Create `.spotify_credentials`:
      ```bash
      echo "SPOTIFY_CLIENT_ID=your_client_id" > .spotify_credentials
      echo "SPOTIFY_CLIENT_SECRET=your_client_secret" >> .spotify_credentials
      echo "SPOTIFY_REDIRECT_URI=https://127.0.0.1:8888/callback" >> .spotify_credentials
      ```
+   - Authenticate for user playback control:
+     ```bash
+     python3 spotify_oauth.py auth
+     ```
 
-3. **Start and Test**:
+3. **Run backend (FastAPI + uvicorn)**:
    ```bash
-   # Start the agent
-   ./music_client.py "shuffle liked songs"
-   
-   # Try some commands
-   ./music "what's playing"
-   ./music "play some mellow music"
-   ./music sync
+   uvicorn backend.main:app --reload --host 127.0.0.1 --port 8000
    ```
+   If `uvicorn` is not in PATH, use:
+   ```bash
+   python3 -m uvicorn backend.main:app --reload --host 127.0.0.1 --port 8000
+   ```
+
+4. **Run frontend (Next.js)**:
+   ```bash
+   cd frontend
+   cp .env.example .env.local
+   npm install
+   npm run dev
+   ```
+
+5. **Open app**:
+   - Frontend: `http://localhost:3000`
+   - Backend health: `http://127.0.0.1:8000/health`
 
 ## 🛠️ Detailed Setup
 
