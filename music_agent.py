@@ -7,6 +7,8 @@ Combines web search, AppleScript control, and all learned strategies for robust 
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
 import subprocess
+import platform
+import shutil
 try:
     from spotify_oauth import SpotifyAuth
 except ImportError:
@@ -15,8 +17,10 @@ import os
 import json
 import time
 import sqlite3
+import requests
 from pathlib import Path
 from typing import Dict, List, Optional, Any
+from urllib.parse import quote
 from config import get_config
 
 class MusicDatabase:
@@ -696,8 +700,18 @@ class ComprehensiveMusicAgent:
     
     def __init__(self, db_path: str = None):
         self.sp = None
+        self.spotify_auth_mode = None
+        self.applescript_available = self._is_applescript_available()
+        if self.applescript_available:
+            print("✅ AppleScript playback backend available")
+        else:
+            print("⚠️  AppleScript unavailable, falling back to Spotify Web API playback")
         self.db = MusicDatabase(db_path)
         self.setup_spotify_connection()
+
+    def _is_applescript_available(self) -> bool:
+        """Check whether AppleScript control is available on this machine."""
+        return platform.system() == "Darwin" and shutil.which("osascript") is not None
         
     def setup_spotify_connection(self):
         """Set up Spotify API connection with proper error handling"""
@@ -709,6 +723,7 @@ class ComprehensiveMusicAgent:
                     is_valid, message = auth.check_auth_status()
                     if is_valid:
                         self.sp = auth.get_spotify_client()
+                        self.spotify_auth_mode = 'oauth'
                         print("✅ Spotify OAuth connection established (full API access)")
                         return
                     else:
@@ -726,13 +741,108 @@ class ComprehensiveMusicAgent:
             
             auth_manager = SpotifyClientCredentials(client_id=client_id, client_secret=client_secret)
             self.sp = spotipy.Spotify(auth_manager=auth_manager)
+            self.spotify_auth_mode = 'client_credentials'
             print("✅ Spotify Client Credentials connection established (limited API access)")
             
         except Exception as e:
             print(f"❌ Error setting up Spotify connection: {e}")
     
+    def _can_use_spotify_playback(self) -> bool:
+        """
+        Spotify playback control endpoints require user OAuth scopes.
+        Client Credentials can search metadata but cannot control playback.
+        """
+        return self.sp is not None and self.spotify_auth_mode == 'oauth'
+    
+    def _get_spotify_device_id(self) -> Optional[str]:
+        """Return an active Spotify device ID, or any available device."""
+        if not self._can_use_spotify_playback():
+            return None
+        
+        try:
+            current_playback = self.sp.current_playback()
+            device = (current_playback or {}).get('device') or {}
+            if device.get('id'):
+                return device['id']
+            
+            devices_response = self.sp.devices() or {}
+            devices = devices_response.get('devices', [])
+            if not devices:
+                return None
+            
+            active_device = next((d for d in devices if d.get('is_active')), None)
+            selected = active_device or devices[0]
+            return selected.get('id')
+        except Exception as e:
+            print(f"⚠️  Could not detect Spotify devices: {e}")
+            return None
+    
+    def _start_playback(self, track_uri: str = None, context_uri: str = None) -> bool:
+        """Start playback via AppleScript when available, otherwise Spotify Web API."""
+        if self.applescript_available:
+            play_target = track_uri or context_uri
+            if play_target:
+                script = f'tell application "Spotify" to play track "{play_target}"'
+            else:
+                script = 'tell application "Spotify" to play'
+            result = self.run_applescript(script)
+            if "❌" in result:
+                print(f"❌ Failed to start playback: {result}")
+                return False
+            return True
+        
+        if not self._can_use_spotify_playback():
+            print("❌ Playback control requires Spotify OAuth. Run: python3 spotify_oauth.py auth")
+            return False
+        
+        device_id = self._get_spotify_device_id()
+        if not device_id:
+            print("❌ No Spotify device available. Open Spotify on a device first.")
+            return False
+        
+        try:
+            if track_uri:
+                self.sp.start_playback(device_id=device_id, uris=[track_uri])
+            elif context_uri:
+                self.sp.start_playback(device_id=device_id, context_uri=context_uri)
+            else:
+                self.sp.start_playback(device_id=device_id)
+            return True
+        except Exception as e:
+            print(f"❌ Spotify playback start failed: {e}")
+            return False
+    
+    def _set_shuffle(self, enabled: bool) -> bool:
+        """Enable or disable shuffle mode on the current playback device."""
+        if self.applescript_available:
+            script = f'tell application "Spotify" to set shuffling to {"true" if enabled else "false"}'
+            result = self.run_applescript(script)
+            if "❌" in result:
+                print(f"❌ Failed to set shuffle mode: {result}")
+                return False
+            return True
+        
+        if not self._can_use_spotify_playback():
+            print("❌ Shuffle control requires Spotify OAuth authentication.")
+            return False
+        
+        device_id = self._get_spotify_device_id()
+        if not device_id:
+            print("❌ No Spotify device available to set shuffle mode.")
+            return False
+        
+        try:
+            self.sp.shuffle(enabled, device_id=device_id)
+            return True
+        except Exception as e:
+            print(f"❌ Failed to set Spotify shuffle mode: {e}")
+            return False
+    
     def run_applescript(self, script: str) -> str:
         """Execute AppleScript with timeout and error handling"""
+        if not self.applescript_available:
+            return "❌ AppleScript unavailable (requires macOS with osascript)"
+        
         try:
             result = subprocess.run(
                 ['osascript', '-e', script],
@@ -750,32 +860,55 @@ class ComprehensiveMusicAgent:
             return f"❌ Unexpected error: {e}"
     
     def get_current_track(self) -> Dict[str, str]:
-        """Get currently playing track info via AppleScript"""
-        script = '''
-        tell application "Spotify"
-            if player state is playing then
-                set trackName to name of current track
-                set artistName to artist of current track
-                return trackName & " | " & artistName
-            else
-                return "Not playing"
-            end if
-        end tell
-        '''
+        """Get currently playing track info using the best available backend."""
+        if self.applescript_available:
+            script = '''
+            tell application "Spotify"
+                if player state is playing then
+                    set trackName to name of current track
+                    set artistName to artist of current track
+                    return trackName & " | " & artistName
+                else
+                    return "Not playing"
+                end if
+            end tell
+            '''
+            
+            result = self.run_applescript(script)
+            if "Not playing" in result or "❌" in result:
+                return {"status": result}
+            
+            try:
+                parts = result.split(" | ")
+                return {
+                    "name": parts[0],
+                    "artist": parts[1],
+                    "status": "playing"
+                }
+            except Exception:
+                return {"status": "Error parsing track info"}
         
-        result = self.run_applescript(script)
-        if "Not playing" in result or "❌" in result:
-            return {"status": result}
+        if not self._can_use_spotify_playback():
+            return {"status": "Playback status unavailable (Spotify OAuth not configured)"}
         
         try:
-            parts = result.split(" | ")
+            playback = self.sp.current_playback()
+            if not playback or not playback.get('item'):
+                return {"status": "Not playing"}
+            
+            item = playback['item']
+            artist_name = item['artists'][0]['name'] if item.get('artists') else 'Unknown'
+            status = "playing" if playback.get('is_playing') else "paused"
+            
             return {
-                "name": parts[0],
-                "artist": parts[1],
-                "status": "playing"
+                "name": item.get('name', 'Unknown'),
+                "artist": artist_name,
+                "album": item.get('album', {}).get('name', 'Unknown'),
+                "uri": item.get('uri'),
+                "status": status
             }
-        except:
-            return {"status": "Error parsing track info"}
+        except Exception as e:
+            return {"status": f"❌ Spotify playback status error: {e}"}
     
     def search_track_fuzzy(self, query: str) -> Optional[Dict[str, Any]]:
         """
@@ -902,11 +1035,8 @@ class ComprehensiveMusicAgent:
                     playlist = playlist_results['playlists']['items'][0]
                     print(f"✅ Found playlist: {playlist['name']} ({playlist['tracks']['total']} tracks)")
                     
-                    # Try to play the playlist
-                    script = f'tell application "Spotify" to play track "{playlist["uri"]}"'
-                    result = self.run_applescript(script)
-                    
-                    if "❌" not in result:
+                    # Try to play the playlist context
+                    if self._start_playback(context_uri=playlist["uri"]):
                         time.sleep(3)  # Give it time to start
                         current = self.get_current_track()
                         if current.get("status") == "playing":
@@ -989,14 +1119,9 @@ class ComprehensiveMusicAgent:
         return False
     
     def play_track(self, track_uri: str) -> bool:
-        """Play a track using AppleScript with verification"""
+        """Play a track using the best available playback backend."""
         print(f"🎵 Playing track: {track_uri}")
-        
-        script = f'tell application "Spotify" to play track "{track_uri}"'
-        result = self.run_applescript(script)
-        
-        if "❌" in result:
-            print(f"❌ Failed to play track: {result}")
+        if not self._start_playback(track_uri=track_uri):
             return False
         
         # Verify playback started
@@ -1019,10 +1144,7 @@ class ComprehensiveMusicAgent:
             print(f"✅ Found playlist: '{playlist['name']}' ({playlist['track_count']} tracks)")
             
             # Play the playlist using its Spotify URI
-            script = f'tell application "Spotify" to play track "{playlist['spotify_uri']}"'
-            result = self.run_applescript(script)
-            
-            if "❌" not in result:
+            if self._start_playback(context_uri=playlist['spotify_uri']):
                 time.sleep(3)  # Give it time to start
                 current = self.get_current_track()
                 if current.get("status") == "playing":
@@ -1056,7 +1178,8 @@ class ComprehensiveMusicAgent:
     
     def shuffle_liked_songs(self) -> bool:
         """Shuffle play liked songs from Spotify"""
-        if not self.sp:
+        if not self._can_use_spotify_playback():
+            print("❌ Liked songs require Spotify OAuth authentication.")
             return False
 
         print("🔀 Shuffling liked songs...")
@@ -1093,16 +1216,12 @@ class ComprehensiveMusicAgent:
         if playlist:
             print(f"✅ Found playlist: '{playlist['name']}' ({playlist['track_count']} tracks)")
             
-            # Play the playlist using its Spotify URI
-            script = f'tell application "Spotify" to play track "{playlist['spotify_uri']}"'
-            result = self.run_applescript(script)
-            
-            if "❌" not in result:
+            # Play the playlist and then enable shuffle mode
+            if self._start_playback(context_uri=playlist['spotify_uri']):
                 time.sleep(3)  # Give it time to start
                 
                 # Turn on shuffle mode
-                shuffle_script = 'tell application "Spotify" to set shuffling to true'
-                shuffle_result = self.run_applescript(shuffle_script)
+                self._set_shuffle(True)
                 
                 current = self.get_current_track()
                 if current.get("status") == "playing":
@@ -1132,14 +1251,23 @@ class ComprehensiveMusicAgent:
         return result
     
     def next_track(self) -> str:
-        """Skip to the next track using AppleScript"""
+        """Skip to the next track using available playback backend."""
         print("⏭️ Skipping to next track...")
-        
-        script = 'tell application "Spotify" to next track'
-        result = self.run_applescript(script)
-        
-        if "❌" in result:
-            return f"❌ Failed to skip to next track: {result}"
+
+        if self.applescript_available:
+            result = self.run_applescript('tell application "Spotify" to next track')
+            if "❌" in result:
+                return f"❌ Failed to skip to next track: {result}"
+        else:
+            if not self._can_use_spotify_playback():
+                return "❌ Next track requires Spotify OAuth playback access."
+            device_id = self._get_spotify_device_id()
+            if not device_id:
+                return "❌ No Spotify device available for skipping tracks."
+            try:
+                self.sp.next_track(device_id=device_id)
+            except Exception as e:
+                return f"❌ Failed to skip to next track: {e}"
         
         # Give it a moment to change tracks, then get the new track info
         time.sleep(2)
@@ -1150,14 +1278,23 @@ class ComprehensiveMusicAgent:
             return f"⏭️ Skipped to next track (status: {current.get('status', 'Unknown')})"
     
     def previous_track(self) -> str:
-        """Skip to the previous track using AppleScript"""
+        """Skip to the previous track using available playback backend."""
         print("⏮️ Skipping to previous track...")
-        
-        script = 'tell application "Spotify" to previous track'
-        result = self.run_applescript(script)
-        
-        if "❌" in result:
-            return f"❌ Failed to skip to previous track: {result}"
+
+        if self.applescript_available:
+            result = self.run_applescript('tell application "Spotify" to previous track')
+            if "❌" in result:
+                return f"❌ Failed to skip to previous track: {result}"
+        else:
+            if not self._can_use_spotify_playback():
+                return "❌ Previous track requires Spotify OAuth playback access."
+            device_id = self._get_spotify_device_id()
+            if not device_id:
+                return "❌ No Spotify device available for skipping tracks."
+            try:
+                self.sp.previous_track(device_id=device_id)
+            except Exception as e:
+                return f"❌ Failed to skip to previous track: {e}"
         
         # Give it a moment to change tracks, then get the new track info
         time.sleep(2)
@@ -1168,26 +1305,31 @@ class ComprehensiveMusicAgent:
             return f"⏮️ Skipped to previous track (status: {current.get('status', 'Unknown')})"
     
     def pause_playback(self) -> str:
-        """Pause playback using AppleScript"""
+        """Pause playback using available playback backend."""
         print("⏸️ Pausing playback...")
-        
-        script = 'tell application "Spotify" to pause'
-        result = self.run_applescript(script)
-        
-        if "❌" in result:
-            return f"❌ Failed to pause: {result}"
+
+        if self.applescript_available:
+            result = self.run_applescript('tell application "Spotify" to pause')
+            if "❌" in result:
+                return f"❌ Failed to pause: {result}"
+        else:
+            if not self._can_use_spotify_playback():
+                return "❌ Pause requires Spotify OAuth playback access."
+            device_id = self._get_spotify_device_id()
+            if not device_id:
+                return "❌ No Spotify device available for pause command."
+            try:
+                self.sp.pause_playback(device_id=device_id)
+            except Exception as e:
+                return f"❌ Failed to pause: {e}"
         
         return "⏸️ Playback paused"
     
     def resume_playback(self) -> str:
-        """Resume playback using AppleScript"""
+        """Resume playback using available playback backend."""
         print("▶️ Resuming playback...")
-        
-        script = 'tell application "Spotify" to play'
-        result = self.run_applescript(script)
-        
-        if "❌" in result:
-            return f"❌ Failed to resume: {result}"
+        if not self._start_playback():
+            return "❌ Failed to resume playback"
         
         # Get current track info
         time.sleep(1)
@@ -1199,26 +1341,20 @@ class ComprehensiveMusicAgent:
     
     def get_track_lyrics(self, artist: str, song: str) -> Optional[str]:
         """
-        Get lyrics for a song using web APIs with timeout
+        Get lyrics for a song from lyrics.ovh with timeout handling.
         """
         print(f"🔍 Getting lyrics for: {song} by {artist}")
         
         try:
-            # Use curl with timeout to fetch lyrics
-            cmd = f'timeout 10s curl -s "https://api.lyrics.ovh/v1/{artist}/{song}"'
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-            
-            if result.returncode == 0:
-                try:
-                    data = json.loads(result.stdout)
-                    if 'lyrics' in data:
-                        lines = data['lyrics'].split('\n')[:4]  # First 4 lines
-                        print("✅ Lyrics found")
-                        return '\n'.join(line.strip() for line in lines if line.strip())
-                except:
-                    pass
-            
-            print("❌ Lyrics API timeout/failed")
+            endpoint = f"https://api.lyrics.ovh/v1/{quote(artist)}/{quote(song)}"
+            response = requests.get(endpoint, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                if 'lyrics' in data:
+                    lines = data['lyrics'].split('\n')[:4]  # First 4 lines
+                    print("✅ Lyrics found")
+                    return '\n'.join(line.strip() for line in lines if line.strip())
+            print(f"❌ Lyrics API returned status {response.status_code}")
             return None
             
         except Exception as e:
@@ -1658,13 +1794,18 @@ class ComprehensiveMusicAgent:
             else:
                 return "❌ No track currently playing to analyze"
         
-        # Handle lyric search
-        elif "where they say" in command_lower or "lyrics" in command_lower:
+        # Handle lyric-fragment discovery requests
+        elif "where they say" in command_lower or "song with" in command_lower:
             # Extract the lyric fragment
             if "where they say" in command_lower:
                 lyric_fragment = command_lower.split("where they say")[1].strip().strip('"\'')
+            elif "song with" in command_lower:
+                lyric_fragment = command_lower.split("song with")[1].strip().strip('"\'')
             else:
-                lyric_fragment = command_lower.replace("lyrics", "").strip()
+                lyric_fragment = ""
+            
+            if not lyric_fragment:
+                return "❌ Please include part of the lyrics. Example: what's that song where they say 'encumbered forever'"
             
             track = self.search_by_lyrics(lyric_fragment)
             if track:
@@ -1830,8 +1971,8 @@ class ComprehensiveMusicAgent:
             else:
                 return f"🔗 No relationships found for '{current['name']}' by {current['artist']}"
         
-        # Handle lyrics requests
-        elif "lyrics" in command_lower:
+        # Handle current-track lyrics requests
+        elif command_lower.strip() == "lyrics" or "show lyrics" in command_lower or "current lyrics" in command_lower:
             # Try to get lyrics for current track
             current = self.get_current_track()
             if current.get("status") == "playing":
