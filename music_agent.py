@@ -710,7 +710,15 @@ class ComprehensiveMusicAgent:
         self.setup_spotify_connection()
 
     def _is_applescript_available(self) -> bool:
-        """Check whether AppleScript control is available on this machine."""
+        """
+        Check whether AppleScript control is available on this machine.
+
+        By default we run in web-first mode for cross-platform behavior.
+        Set MUSIC_AGENT_WEB_ONLY=0 to explicitly allow AppleScript control.
+        """
+        web_only = os.getenv("MUSIC_AGENT_WEB_ONLY", "1").strip().lower() not in {"0", "false", "no"}
+        if web_only:
+            return False
         return platform.system() == "Darwin" and shutil.which("osascript") is not None
         
     def setup_spotify_connection(self):
