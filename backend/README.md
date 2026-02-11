@@ -10,6 +10,12 @@ From the repository root:
 uvicorn backend.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
+If `uvicorn` is not in PATH:
+
+```bash
+python3 -m uvicorn backend.main:app --reload --host 127.0.0.1 --port 8000
+```
+
 ## Endpoints
 
 - `GET /health` - service health check

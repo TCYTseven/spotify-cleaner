@@ -77,6 +77,10 @@ The agent uses SQLite to store:
    ```bash
    uvicorn backend.main:app --reload --host 127.0.0.1 --port 8000
    ```
+   If `uvicorn` is not in PATH, use:
+   ```bash
+   python3 -m uvicorn backend.main:app --reload --host 127.0.0.1 --port 8000
+   ```
 
 4. **Run frontend (Next.js)**:
    ```bash
